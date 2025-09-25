@@ -1,0 +1,93 @@
+<Malicious Office macro drop → script execution from user Temp>
+action='createfile' AND filepath startswith '\\Users\\' AND (filepath contains '\\AppData\\Local\\Temp\\' || filepath contains '\\AppData\\Roaming\\') 
+  AND later action='createprocess' AND filename.dst IN ('wscript.exe','cscript.exe','powershell.exe') 
+  AND param.dst contains '.vbs' || param.dst contains '.js' || param.dst contains '-EncodedCommand'
+\\Office macro drops that write script files to user temp/roaming and then invoke script hosts or encoded PowerShell — typical spearphish dropper → loader sequence.
+\\MITRE: T1204.002, T1059.001, T1105
+
+<Watering-hole style web compromise: browser spawns downloader from Temp then network POSTs>
+action='createprocess' AND parent.filename.src IN ('chrome.exe','firefox.exe','msedge.exe') 
+  AND later action='createfile' AND filepath contains '\\AppData\\Local\\Temp\\' AND filepath endswith '.exe' 
+  AND later (network_connect AND direction='outbound' AND method='POST') AND avg(payload_size) < 2048
+\\Browser-initiated file written to Temp followed by outbound small POSTs — indicates watering-hole drive-by download with immediate beaconing.
+\\MITRE: T1189, T1105, T1071
+
+<Service creation pointing to binary under AppData or Public>
+action='createprocess' AND filename.dst='sc.exe' AND param.dst contains 'create' 
+  AND (param.dst contains '\\AppData\\' || param.dst contains '\\Users\\Public\\') 
+  AND NOT file.signer.exists=true
+\\Services created that point to executables located in user-writable locations are suspicious persistence mechanisms (malicious service installed under AppData/Public).
+\\MITRE: T1543.003, T1053.005
+
+<RDP enablement via registry change from non-admin automation or suspicious process>
+action='regmodify' AND reg.path contains 'System\\CurrentControlSet\\Control\\Terminal Server' AND reg.value contains 'fDenyTSConnections' 
+  AND reg.new_value IN (0) AND process.filename.src NOT IN ('safi.exe','trusted_patch_tool.exe') 
+  AND user.all NOT IN ('NT AUTHORITY\\SYSTEM')
+\\Registry change that disables RDP denial (enabling RDP) by a non-system process or unexpected installer — often used to enable remote access for adversaries.
+\\MITRE: T1021.001, T1543
+
+<Credential dumping followed by lateral execution via WMIC/PsExec>
+action='createprocess' AND filename.dst IN ('procdump.exe','rundll32.exe','powershell.exe','lsass.exe') 
+  AND (param.dst contains '-ma' || param.dst contains 'sekurlsa' || param.dst contains 'lsass') 
+  AND later action='createprocess' AND filename.dst IN ('wmic.exe','psexec.exe','sc.exe','schtasks.exe')
+\\LSASS memory access/dump or mimikatz-style invocation followed by immediate use of remote execution tools — credential theft enabling lateral movement.
+\\MITRE: T1003, T1021
+
+<Suspicious SMB write to ADMIN$ or creation of remote scheduled task targeting user-writable path>
+action='network_write' AND protocol='SMB' AND filepath contains '\\\\' AND (filepath contains '\\ADMIN$\\' || filepath contains '\\C$\\') 
+  AND later (action='createprocess' AND filename.dst='schtasks.exe' AND param.dst contains '\\\\') 
+\\Remote write to admin share followed by remote scheduled-task creation pointing to network/user-writable paths — classic payload drop + persistence during lateral spread.
+\\MITRE: T1021.002, T1053.005
+
+<Living-off-the-land downloader used to stage payload into Temp and execute>
+filename.src IN ('certutil.exe','bitsadmin.exe','powershell.exe','bitsadmin.exe','curl.exe','wget.exe') 
+  AND param.dst contains 'http://' OR param.dst contains 'https://' 
+  AND param.dst contains '%temp%' OR param.dst contains '\\AppData\\Local\\Temp\\' 
+  AND later action='createprocess' AND filename.dst NOT IN (trusted_installer_list)
+\\Use of built-in downloaders to save payload into Temp/roaming and then execute — common staging technique for targeted intrusions.
+\\MITRE: T1105, T1218
+
+<Data staging: large archive created from user documents then moved to network location>
+action='createprocess' AND filename.dst IN ('7z.exe','zip.exe','powershell.exe') 
+  AND param.dst contains '%userprofile%\\Documents' OR param.dst contains '%userprofile%\\Desktop' 
+  AND later action='network_write' AND (filepath contains '\\\\' OR param.dst contains 's3://' || param.dst contains 'upload') 
+\\Creation of large archives of user documents followed by write/transfer to network/cloud indicates staging for exfiltration.
+\\MITRE: T1041, T1537
+
+<Beaconing: process created from AppData contacting many distinct external domains with small payloads>
+action='createprocess' AND directory.src contains '\\AppData\\' OR directory.src contains '\\Users\\Public\\' 
+  AND filename.dst IN ('powershell.exe','rundll32.exe','curl.exe') 
+  AND later (network_connect AND direction='outbound') 
+  AND count(unique(domain.dst)) >= 5 within 1800s by host.id AND avg(payload_size) < 1024
+\\Processes launched from user-writable locations contacting many distinct external domains with small payloads — suggests C2 rotation/beaconing.
+\\MITRE: T1071
+
+<Process hollowing / injection indicators after spawn from unusual parent>
+parent.directory.src contains '\\AppData\\' OR parent.directory.src contains '\\Users\\Public\\' 
+  AND (action contains 'openprocess' OR param.dst contains 'VirtualAllocEx' OR param.dst contains 'WriteProcessMemory' OR param.dst contains 'CreateRemoteThread') 
+  AND target.filename NOT IN ('explorer.exe','svchost.exe') OR target.user NOT IN ('LOCAL SERVICE','NETWORK SERVICE')
+\\User-space processes originating from AppData using process-injection APIs into other processes — indicates process hollowing/injection for stealthy execution.
+\\MITRE: T1055
+
+<Defense tampering: backup/SIEM/EDR service stop then file delete of logs or backups>
+action='createprocess' AND filename.dst IN ('net.exe','sc.exe','powershell.exe') 
+  AND (param.dst contains 'stop' && param.dst contains 'service') AND later (file.delete AND filepath contains '\\ProgramData\\') 
+  AND NOT (param.dst contains 'AVVendorApprove') 
+\\Stopping backup or security services followed by deletion of logs/backups indicates pre-encryption cleanup and evasion activity.
+\\MITRE: T1546.004, T1486
+
+<High-confidence lateral chain: spearphish drop → credential dump → SMB fan-out → scheduled task on remote hosts>
+action='createfile' AND filepath contains '\\AppData\\Local\\Temp\\' 
+  AND later action='createprocess' AND filename.dst IN ('powershell.exe','wscript.exe') AND param.dst contains '-enc' 
+  AND later action='createprocess' AND filename.dst IN ('mimikatz.exe','procdump.exe') 
+  AND later action='network_connect' AND protocol='SMB' AND count(ip.dst) >= 10 within 1200s by host.id 
+  AND later action='createprocess' AND filename.dst='schtasks.exe' AND param.dst contains '\\\\'
+\\Sequence: user-temp drop → encoded execution → credential dumping → high SMB fan-out → remote scheduled task creation — high-confidence targeted intruder lateralization pattern.
+\\MITRE: T1204.002, T1059.001, T1003, T1021.002, T1053.005
+
+<Uncommon tool usage: interactive remote-control clients spawned from non-interactive accounts>
+action='createprocess' AND filename.dst IN ('AnyDesk.exe','TeamViewer.exe','VNC.exe','radmin.exe') 
+  AND user.all IN ('SERVICE_ACCOUNT','svc_automation') OR parent.filename.src IN ('taskhost.exe','svchost.exe') 
+  AND NOT file.signer.exists=true
+\\Remote-control clients launched by service/automation accounts or by non-interactive parent processes — indicates remote access setup by an adversary rather than legitimate admin.
+\\MITRE: T1021.001, T1219
