@@ -1,0 +1,90 @@
+<SMB lateral fan-out — many outbound SMB connections from single host>
+action='network_connect' AND protocol='SMB' AND direction='outbound' 
+  AND count(ip.dst) >= 15 within 600s by host.id
+\\Rapid SMB fan-out from one host indicates worm-like lateral propagation or mass scanning/exploitation.
+\\MITRE: T1210, T1021.002
+
+<SMB write to ADMIN$ or C$ followed by remote service/task creation>
+action='network_write' AND protocol='SMB' AND (filepath contains '\\\\' && (filepath contains '\\ADMIN$\\' || filepath contains '\\C$\\')) 
+  AND later (action='network_connect' AND protocol='RPC' OR action='createprocess' AND filename.dst IN ('psexec.exe','sc.exe','schtasks.exe')) 
+\\Remote file writes to admin shares then remote service/task creation — common post-exploit lateral execution and payload deployment behavior.
+\\MITRE: T1021.002, T1053.005
+
+<Credential dump execution targeting LSASS memory followed by remote exec tooling>
+action='createprocess' AND filename.dst IN ('procdump.exe','rundll32.exe','powershell.exe','mimikatz.exe') 
+  AND param.dst contains 'lsass' OR param.dst contains '-ma' OR param.dst contains 'sekurlsa' 
+  AND later action='createprocess' AND filename.dst IN ('psexec.exe','wmic.exe','schtasks.exe')
+\\LSASS memory access/dump followed by immediate use of remote execution tools — credential theft enabling lateral movement.
+\\MITRE: T1003, T1021
+
+<EFI file write to boot path from non-signed binary>
+action='createfile' AND filepath contains '\\EFI\\' OR filepath contains '\\EFI\\Microsoft\\Boot\\' 
+  AND filepath endswith '.efi' AND file.signer.exists=false AND file.created_within last 7d
+\\Unsigned files written to EFI or bootloader paths suggest UEFI bootloader replacement or malicious boot component dropped to bypass Secure Boot.
+\\MITRE: T1542.001, T1542
+
+<Raw physical drive open with write intent>
+action='openfile' AND filepath IN ('\\\\.\\PhysicalDrive0','\\\\.\\PhysicalDrive1','\\\\?\\GLOBALROOT\\Device\\Harddisk0\\DR0') 
+  AND (param.dst contains 'GENERIC_WRITE' || param.dst contains 'WRITE' || param.dst contains 'IOCTL_DISK') 
+  AND process.filename.src NOT IN ('setup.exe','installutil.exe','driverinstall.exe')
+\\Processes opening raw physical drives with write permissions/IOCTLs indicates potential MBR/boot sector overwrite or destructive disk manipulation.
+\\MITRE: T1490, T1542
+
+<VSS shadow delete by non-standard tools or non-system accounts>
+action='createprocess' AND filename.dst IN ('vssadmin.exe','wbadmin.exe','powershell.exe','wmic.exe') 
+  AND (param.dst contains 'delete shadows' || param.dst contains 'Delete Shadows' || param.dst contains 'delete catalog') 
+  AND user.all NOT IN ('NT AUTHORITY\\SYSTEM') 
+\\Deletion of shadow copies/backups by non-system accounts or unusual processes often precedes destructive encryption to prevent recovery.
+\\MITRE: T1490, T1486
+
+<Unsigned kernel driver placed into drivers folder and service created>
+action='createfile' AND filepath startswith 'C:\\Windows\\System32\\drivers\\' AND filepath endswith '.sys' 
+  AND file.signer.exists=false AND file.created_within last 7d 
+  AND later action='createprocess' AND filename.dst='sc.exe' AND param.dst contains 'create' || param.dst contains 'binPath='
+\\New unsigned kernel driver files + service creation indicate possible malicious driver for raw disk access or persistence.
+\\MITRE: T1542, T1547
+
+<Boot configuration / BCD modification by non-admin context>
+action='createprocess' AND filename.dst IN ('bcdedit.exe','bootcfg.exe') 
+  AND (param.dst contains '/set' || param.dst contains '/store' || param.dst contains '\\EFI\\') 
+  AND user.all NOT IN ('NT AUTHORITY\\SYSTEM','LOCAL SERVICE') 
+  AND NOT (param.dst contains 'SCCM' || param.dst contains 'MDT')
+\\Unauthorized BCD/boot configuration changes by non-system accounts can indicate bootloader replacement or persistence attempts.
+\\MITRE: T1542.001, T1547
+
+<Mass file overwrite/rapid writes across user data set>
+action='writefile' AND filepath startswith '\\Users\\' 
+  AND (filepath endswith '.docx' OR filepath endswith '.xlsx' OR filepath endswith '.pdf' OR filepath endswith '.jpg' OR filepath endswith '.txt') 
+  AND count(writefile) >= 200 within 180s by process.pid
+\\A single process rapidly overwriting many user files is indicative of mass encryption/destructive activity.
+\\MITRE: T1486, T1490
+
+<Process created from Temp that spawns networking and small periodic outbound posts>
+action='createprocess' AND directory.src contains '\\AppData\\Local\\Temp\\' OR directory.src contains '\\AppData\\Roaming\\' 
+  AND filename.dst IN ('powershell.exe','rundll32.exe','curl.exe','wget.exe') 
+  AND later (network_connect AND direction='outbound' AND ip.dst exists) 
+  AND count(network_connect) >= 6 within 3600s by host.id AND avg(payload_size) < 2048
+\\Ephemeral-launched binaries from Temp making periodic, small outbound HTTP(S) requests are typical beaconing/C2 behavior.
+\\MITRE: T1071
+
+<SMB exploit-like RPC traffic followed by unexpected remote admin actions>
+action='network_connect' AND protocol='SMB' AND (network_payload contains 'MSRPC' || network_payload contains 'Trans2' || network_payload contains 'SMB2 NT_CREATE') 
+  AND later (action='createprocess' AND filename.dst IN ('sc.exe','psexec.exe','wmic.exe','schtasks.exe'))
+\\Anomalous SMB/RPC packets followed by remote admin tooling activity is consistent with exploitation followed by lateral command execution.
+\\MITRE: T1210, T1021.002
+
+<EFI variable modification API usage from unsigned context>
+action='createprocess' AND (param.dst contains 'SetFirmwareEnvironmentVariable' || filename.dst IN ('powershell.exe','bcdedit.exe')) 
+  AND later (action='createfile' AND filepath contains '\\EFI\\') 
+  AND file.signer.exists=false
+\\Unsigned processes invoking firmware environment variable modifications or writing EFI files point to attempts to alter UEFI boot variables or bypass Secure Boot.
+\\MITRE: T1542.001, T1542
+
+<High-confidence sequence — temp drop → encoded execution → raw disk IO → reboot>
+action='createfile' AND filepath contains '\\AppData\\Local\\Temp\\' 
+  AND later action='createprocess' AND filename.dst='powershell.exe' AND (param.dst contains '-enc' || param.dst contains '-EncodedCommand') 
+  AND later action='devicecontrol' AND (param.dst contains 'IOCTL_DISK' || filepath IN ('\\\\.\\PhysicalDrive0')) 
+  AND later system.event='reboot'
+\\Sequence of Temp drop → encoded execution → direct disk IO/IOCTLs → immediate reboot is high-confidence for boot-level destructive ransomware or bootloader replacement.
+\\MITRE: T1105, T1059.001, T1490, T1542
+
