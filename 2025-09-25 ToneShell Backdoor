@@ -1,0 +1,85 @@
+<Dropper: new file created under user temp/roaming then immediately executed>
+action='createfile' && filepath startswith '\\Users\\' && (filepath contains '\\AppData\\Local\\Temp\\' || filepath contains '\\AppData\\Roaming\\') 
+  AND later action='createprocess' AND parent.filepath contains '\\AppData\\Local\\Temp\\' OR parent.filepath contains '\\AppData\\Roaming\\'
+  AND filename.dst IN ('rundll32.exe','powershell.exe','cmd.exe') 
+  AND NOT file.signer.exists=true
+\\ Loader/dropper writes to user-writable path then launches — classic initial stage.
+\\ MITRE: T1105, T1218
+
+<Encoded/obfuscated PowerShell launched from user context>
+action='createprocess' && filename.dst='powershell.exe' && (param.dst contains '-enc' || param.dst contains '-EncodedCommand' || param.dst contains '-nop -w hidden') 
+  AND directory.src startswith '\\Users\\' && user.all NOT IN ('NT AUTHORITY\\SYSTEM') 
+  AND later (network_connect && ip.dst exists)
+\\Obfuscated PS from user path with subsequent network traffic — likely staged backdoor execution.
+\\MITRE: T1059.001, T1071
+
+<Persistence: scheduled task created pointing at file in Temp/Roaming>
+action='createprocess' && filename.dst='schtasks.exe' && param.dst contains '/create' 
+  AND (param.dst contains '%temp%' || param.dst contains '\\AppData\\Local\\Temp\\' || param.dst contains '\\AppData\\Roaming\\') 
+  AND NOT (param.dst contains 'SCCM' || param.dst contains 'Patch' || param.dst contains 'Microsoft')
+\\Attacker schedules persistent execution from user-writable path.
+\\MITRE: T1053.005
+
+<Beaconing: process created from Temp/Roaming making periodic small outbound HTTP(S) posts>
+action='createprocess' AND (directory.src contains '\\AppData\\Local\\Temp\\' OR directory.src contains '\\AppData\\Roaming\\') 
+  AND filename.dst IN ('powershell.exe','rundll32.exe','curl.exe','wget.exe') 
+  AND later (network_connect AND direction='outbound' AND ip.dst exists) 
+  AND count(network_connect) >= 6 within 1800s by host.id AND avg(payload_size) < 1024
+\\Periodic small outbound connections from ephemeral-launched binaries = beacon/C2.
+\\MITRE: T1071
+
+<Downloader: commandline contains direct HTTP(S) download into Temp followed by execution>
+filename.src IN ('certutil.exe','bitsadmin.exe','powershell.exe','curl.exe','wget.exe') 
+  AND param.dst contains 'http://' OR param.dst contains 'https://' 
+  AND param.dst contains '%temp%' OR param.dst contains '\\AppData\\Local\\Temp\\' 
+  AND later action='createprocess' AND filename.dst NOT IN (trusted_installer_list)
+\\Direct staging to Temp + execution indicates ingress tool transfer + execution.
+\\MITRE: T1105
+
+<Module loading: rundll32 or regsvr32 used to load DLL from non-standard directory>
+action='createprocess' && filename.dst IN ('rundll32.exe','regsvr32.exe') 
+  AND param.dst contains '.dll' AND param.dst contains '\\AppData\\' OR param.dst contains '\\Users\\Public\\' 
+  AND NOT (file.signer.exists=true)
+\\Execution of DLLs from user-writable locations via common loaders = loader/loader persistence.
+\\MITRE: T1218, T1055 (if injection)
+
+<Process injection indicators following spawn from AppData>
+parent.directory.src contains '\\AppData\\' OR parent.directory.src contains '\\Users\\Public\\' 
+  AND (action contains 'openprocess' OR param.dst contains 'VirtualAllocEx' OR param.dst contains 'WriteProcessMemory' OR param.dst contains 'CreateRemoteThread') 
+  AND target.filename NOT IN ('explorer.exe','svchost.exe') OR target.user NOT IN ('LOCAL SERVICE','NETWORK SERVICE')
+\\User-space origin process using injection APIs into other processes — process hollowing/injection pattern.
+\\MITRE: T1055
+
+<Network anomaly: HTTP POST to uncommon domain with uncommon User-Agent after being launched from Temp>
+action='network_connect' AND method='POST' AND direction='outbound' 
+  AND (process.filename.src='powershell.exe' OR process.directory.src contains '\\AppData\\Local\\Temp\\') 
+  AND request.headers.user_agent exists AND user_agent NOT IN (known_browser_agents) 
+  AND domain.dst does not endwith '.microsoft.com' AND payload_size < 2048
+\\Backdoors often use HTTP POSTs with small payloads to exfil/beacon and custom user agents.
+\\MITRE: T1071.001
+
+<Staged plugin execution: newly created executable in AppData then child process starts and loads many modules>
+action='createfile' AND filepath contains '\\AppData\\' AND filepath endswith '.exe' 
+  AND later action='createprocess' AND parent.filepath contains '\\AppData\\' AND count(child.loaded_modules) >= 4 within 60s
+\\Backdoors often download/execute modular components (many modules loaded quickly).
+\\MITRE: T1105 / T1055 (depending on behavior)
+
+<Temp-created PowerShell with encoded command + multiple outbound IPs (beacon + downloader)>
+action='createfile' AND filepath contains '\\AppData\\Local\\Temp\\' 
+  AND later action='createprocess' AND filename.dst='powershell.exe' AND param.dst contains '-enc' 
+  AND later count(network_connect) >= 3 within 600s AND (count(unique(ip.dst)) >=2)
+\\Chain of createfile → encoded PowerShell → multiple outbound connections = high-confidence compromise.
+\\MITRE: multi-technique (Execution + C2 + Ingress)
+
+<Defensive evasion: binary in protected folder replaced by unsigned binary (new file under Program Files)>
+action='createfile' AND filepath startswith 'C:\\Program Files' OR filepath startswith 'C:\\Windows\\System32' 
+  AND file.signer.exists=false AND filepath endswith '.exe' AND file.created_within last 3d
+\\Unsigned executables newly appearing in system folders can indicate tampering or malicious installers.
+\\MITRE: T1547, T1195
+
+<Exfil staging: archive creation of Documents followed by outbound HTTPS to unusual host>
+action='createprocess' AND filename.dst IN ('7z.exe','zip.exe','powershell.exe') 
+  AND param.dst contains '%userprofile%\\Documents' OR param.dst contains '%userprofile%\\Desktop' 
+  AND later (network_connect AND direction='outbound' AND ip.dst exists) AND count(network_connect) >= 1 within 300s
+\\zipping user documents then outbound transfer — likely data staging/exfil.
+\\MITRE: T1041/T1537
