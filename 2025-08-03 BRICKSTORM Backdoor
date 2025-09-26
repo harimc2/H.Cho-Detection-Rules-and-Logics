@@ -1,0 +1,144 @@
+<Appliance management IP egress to non-vendor destinations>
+action='network_connect' AND source.ip IN (appliance_mgmt_ips) AND direction='outbound'
+  AND NOT (domain.dst in (vendor_update_domains) OR ip.dst in (vendor_cdn_ranges))
+  AND count(network_connect) >= 3 within 3600s by source.ip
+\\Appliances/management interfaces should rarely contact arbitrary internet hosts — outbound connections from appliance mgmt IPs to unusual domains/IPs indicate beaconing or C2.
+\\MITRE: T1071.001
+
+<Multiple DNS-over-HTTPS (DoH) endpoints contacted from single appliance>
+action='network_connect' AND source.ip IN (appliance_mgmt_ips) AND protocol='HTTPS'
+  AND (request.url contains 'dns-query' || request.url contains '/dns-query')
+  AND count(unique(ip.dst)) >= 5 within 24h by source.ip
+\\Appliances querying multiple DoH resolvers is anomalous and matches BRICKSTORM use of DoH to obscure DNS C2.
+\\MITRE: T1071.001
+
+<Unknown endpoint contacting both Cloudflare Workers/Heroku-like hosts and DoH within short window>
+action='network_connect' AND source.ip IN (appliance_mgmt_ips) 
+  AND (target.hostname =~ /\.workers\.dev$|\.herokuapp\.com$/ OR request.url contains 'dns-query')
+  AND match_same(source.ip) within 2h
+\\Appliance contacting cloud worker hostnames and DoH endpoints in close time proximity — pattern seen for BRICKSTORM C2 delivery via cloud workers and DoH.
+\\MITRE: T1071.001
+
+<SSH service enablement on vCenter / ESXi via VAMI or config change>
+log.source='vami' OR log.source='vmware_audit' AND (log.message contains 'ssh' || log.message contains 'sshd')
+  AND (log.message contains 'enable' || log.message contains 'start' || regmodify.path contains '/etc/ssh' )
+  AND NOT (change.request_ticket exists)
+\\Enabling SSH on vSphere appliances (VAMI changes) is suspicious when performed ad-hoc; BRICKSTORM enabled SSH to install backdoors.
+\\MITRE: T1098, T1543
+
+<Creation of new local vCenter/ESXi accounts then deletion soon after>
+log.source='vmware_audit' AND (action IN ('user.create','account.add') OR param.dst contains 'BashShellAdministrators')
+  AND later (action IN ('user.delete','account.remove')) within 3600s by account.name
+\\Adversary-created local admin accounts used for installation then removed to hide tracks — observed with BRICKSTORM actor.
+\\MITRE: T1078, T1531
+
+<Init script modification via sed or echo to persist binary on reboot>
+action='createprocess' AND filename.dst IN ('sed','sh','bash') 
+  AND param.dst contains 'sed -i' || param.dst contains 'rc.local' || param.dst contains 'systemd' 
+  AND later (file.modify AND filepath matches '/etc/init.d/*|/etc/rc.local|/lib/systemd/system/*') within 120s
+\\Automated modification of init.d/rc.local/systemd to add startup entries (often by sed) indicates persistence installation on appliances.
+\\MITRE: T1547
+
+<Dropper writes into VMware UI paths (vami-httpd, /opt/vmware/sbin/, /home/vsphere-ui/)>
+action='createfile' AND (filepath contains '/opt/vmware/sbin/' || filepath contains '/home/vsphere-ui/' || filepath contains 'vami-httpd')
+  AND file.signer.exists=false AND file.created_within last 7d
+\\UNIX appliance binaries or dropper files written under VMware/vami paths indicate BRICKSTORM-like implant placement or masquerade.
+\\MITRE: T1543.003, T1195
+
+<In-memory modification of webserver/Tomcat servlet filter activity>
+log.source='tomcat' OR log.source='httpd' AND (log.message contains 'FilterDef' || log.message contains 'FilterMap' || log.message contains '/websso/SAML2/SSO/')
+  AND (file.modify NOT observed OR parent.process IN ('curl','wget','python','bash'))
+\\Indicators of a servlet filter being installed/modified (BRICKSTEAL behavior) — may be done entirely in memory but HTTP responses/logs reveal decoding/exfil behaviors on SSO URIs.
+\\MITRE: T1213, T1190
+
+<HTTP request patterns hitting /web/saml2/sso/* and containing Basic auth-like payloads>
+action='http_request' AND request.uri matches '/web/saml2/sso/.*' 
+  AND (request.headers.authorization exists OR request.body contains 'Basic ' || request.body contains 'Authorization: Basic')
+  AND count(request) >= 1 within 86400s by src.ip
+\\BRICKSTEAL-like servlet filters target SAML SSO URIs to harvest credentials — logs with Basic auth headers or decoded auth material on these URIs are high-value.
+\\MITRE: T1552.001, T1110
+
+<vCenter VPXD clone events for sensitive VMs (cloning then quick deletion)>
+log.source='vpxd' AND (log.message contains 'VmClonedEvent' || log.message contains 'VmBeingClone')
+  AND (target.vm.tags contains 'Domain Controller' || target.vm.tags contains 'SecretServer' || target.vm.tags contains 'Vault') 
+  AND later (log.message contains 'VmRemovedEvent' || action='vm.delete') within 3600s
+\\Adversary cloning sensitive VMs (DCs, secret vaults) then deleting clones to mount offline analysis of disk/files — BRICKSTORM used this to exfiltrate secrets.
+\\MITRE: T1008, T1537
+
+<Appliance-initiated SMB/Type 3 logins to Windows hosts (appliance->Windows authenticated access)>
+action='auth' AND source.ip IN (appliance_mgmt_ips) AND dest.system_type IN ('Windows') 
+  AND auth.protocol IN ('NTLM','Kerberos') AND auth.type='Network' AND NOT (service_account in (known_scanners))
+\\Appliances rarely authenticate to internal Windows hosts; such authenticated connections (type 3) are strong indicators of lateral access via compromised appliance.
+\\MITRE: T1021.002
+
+<SOCKS proxy usage from appliance process tunneling to internal resources>
+process.filename.src IN ('brickstorm','custom_backdoor','socksd','some_go_binary') OR (process.params contains 'SOCKS' || param.dst contains 'socks5://')
+  AND later (network_connect AND dest.internal=true) AND count(network_connect) >= 5 within 1800s by process.pid
+\\BRICKSTORM exposes SOCKS proxy functionality to tunnel an operator's workstation into internal network — detect appliance-origin SOCKS usage and many internal connections through it.
+\\MITRE: T1090.003, T1071
+
+<Access to credential/secrets stores (Secret Server / Delinea) from non-standard source>
+action='http_request' AND dest.app IN ('Delinea_SecretServer','SecretServer') 
+  AND source.ip IN (appliance_mgmt_ips) OR user.agent NOT IN (expected_agents) 
+  AND later (file.read AND filepath contains 'secrets' OR param.dst contains 'decrypt') within 600s
+\\Appliances accessing credential vault web apps (and performing automated downloads/decrypts) indicates theft of stored credentials; BRICKSTORM used stolen credentials to pivot.
+\\MITRE: T1539, T1003
+
+<File system / backup scan: YARA-like match or BRICKSTORM string/hex patterns in appliance backups>
+action='scan' AND data_source IN ('backup_store','appliance_filesystem') 
+  AND file.content matches_any (yara_brickstorm_patterns) AND filesize < 5MB
+\\BRICKSTORM detection via YARA rules on backups/appliance files is effective because appliances often lack EDR — scan backups and images for in-band artifacts.
+\\MITRE: T1083, T1195
+
+<Mail/EWS/M365 Enterprise App full_mailbox access by non-standard app client ID>
+action='api_access' AND platform='M365' AND api.scope IN ('mail.read','full_access_as_app') 
+  AND client.id NOT IN (approved_enterprise_apps) 
+  AND count(mailitemsaccessed) >= 10 within 86400s by client.id
+\\Unauthorized Enterprise App with mailbox-wide scopes accessing multiple target mailboxes over time — BRICKSTORM investigations show this pattern for mailbox theft.
+\\MITRE: T1114, T1537
+
+<High-confidence chain: appliance file write to VMware UI path → SSH enablement → vCenter clone → SOCKS tunnel outbound>
+action='createfile' AND filepath contains '/opt/vmware/sbin/' 
+  AND later log.source='vami' AND log.message contains 'ssh enable' within 600s 
+  AND later log.source='vpxd' AND (log.message contains 'VmBeingClone' || log.message contains 'VmClonedEvent') within 3600s 
+  AND later (process.params contains 'SOCKS' OR network_connect internal.count >= 5) within 7200s
+\\Sequence: backdoor dropped onto VMware appliance, SSH enabled, sensitive VM cloned, and SOCKS-based tunneling — high-confidence BRICKSTORM compromise lifecycle.
+\\MITRE: T1195, T1098, T1008, T1090.003
+
+<Unusual webshell (JSP) activity executing OS commands via HTTP request bodies>
+action='http_request' AND (request.uri contains '.jsp' || request.uri contains '/webshell') 
+  AND (request.body contains 'Runtime.getRuntime' || request.body contains '/bin/sh' || request.body contains 'Base64.getDecoder')
+  AND response.status = 200
+\\JSP webshells like SLAYSTYLE/BEEFLUSH execute OS commands and return output in HTTP responses — detect JSP requests containing runtime exec patterns or base64-decoded payloads.
+\\MITRE: T1505.003, T1059
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
