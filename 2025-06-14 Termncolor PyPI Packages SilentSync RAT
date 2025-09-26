@@ -1,0 +1,70 @@
+<PyPI package writes to site-packages then helper.py created in Temp and executed>
+action='createfile' AND filepath contains '\\site-packages\\' AND filepath endswith '.py' 
+  AND later action='createfile' AND filepath contains '%temp%\\helper.py' 
+  AND later action='createprocess' AND filename.dst IN ('python.exe','pythonw.exe') AND param.dst contains 'helper.py'
+\\Malicious PyPI package dropper writes code into site-packages, fetches/writes helper.py into Temp and executes it — typical supply-chain -> loader behavior (SilentSync delivery).
+\\MITRE: T1195, T1105, T1059.006
+
+<Helper fetched from pastebin/raw then executed from Temp>
+action='network_connect' AND direction='outbound' AND method='GET' AND request.url contains 'pastebin.com/raw' 
+  AND later action='createfile' AND filepath contains '%temp%\\helper.py' 
+  AND later action='createprocess' AND filename.dst IN ('python.exe','pythonw.exe') AND param.dst contains 'helper.py'
+\\Downloader fetches a helper script from a pastebin/raw URL into %TEMP% and that helper is executed — clear staged downloader → payload execution pattern.
+\\MITRE: T1105, T1218
+
+<Base64-decoder use in Python process followed by outbound HTTP to app-port 5000>
+process.filename.src IN ('python.exe','pythonw.exe') AND (param.src contains 'b64decode' || param.src contains 'base64') 
+  AND later (network_connect AND direction='outbound' AND protocol IN ('HTTP','HTTPS') AND dest.port=5000) within 300s
+\\Python runtime decoding Base64 payload/strings then contacting an HTTP service on port 5000 — matches SilentSync behavior of decoding C2 IP/endpoint and contacting custom REST API.
+\\MITRE: T1140, T1071.001
+
+<Beacon / C2 REST endpoints observed (checkin/comando/respuesta/archivo)>
+action='network_connect' AND direction='outbound' AND protocol IN ('HTTP','HTTPS') 
+  AND (request.uri contains '/checkin' || request.uri contains '/comando' || request.uri contains '/respuesta' || request.uri contains '/archivo') 
+  AND (method IN ('GET','POST') || request.body exists)
+\\Client polling or posting to REST endpoints like /checkin /comando /respuesta /archivo — behavioral indicator of SilentSync-style C2 and tasking.
+\\MITRE: T1071.001
+
+<PyHelper persistence in HKCU Run key created by non-installer context>
+action='regmodify' AND reg.path='HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' 
+  AND (reg.new_value contains 'PyHelper' || reg.new_value regex '(?i)pyhelper') 
+  AND NOT (parent.filename.src IN ('pip.exe','msiexec.exe','trusted_installer.exe'))
+\\Malware registering a HKCU Run value named PyHelper to persist Python helper — observed SilentSync persistence on Windows.
+\\MITRE: T1547.001, T1543
+
+<Cross-platform persistence: @reboot crontab or LaunchAgent created referencing python helper>
+(action='crontab_modify' AND crontab.entry contains '@reboot' AND crontab.entry contains 'python') 
+  OR (action='createfile' AND filepath contains '~/Library/LaunchAgents/' AND filepath endswith '.plist' AND filepath contains 'pyhelper' )
+\\SilentSync ensures persistence across OSes; detection of @reboot cron entries or LaunchAgent plists that run python helpers indicates implant persistence.
+\\MITRE: T1547, T1543
+
+<Browser credential store access by Python process originating from site-packages or Temp>
+action='openfile' AND (filepath contains 'Login Data' || filepath contains 'Cookies' || filepath contains 'Web Data' || filepath contains 'key4.db') 
+  AND process.filename.src IN ('python.exe','pythonw.exe') 
+  AND (parent.filepath contains '\\site-packages\\' || parent.filepath contains '%temp%\\') 
+  AND NOT (process.filename.src IN ('browser_helper.exe','browser_updater.exe'))
+\\Python process reading browser credential/cookie/storage files (Chrome/Edge/Brave/Firefox) — matches SilentSync browserdata collection capability.
+\\MITRE: T1555, T1537
+
+<Archive directory of user files then upload followed by local cleanup>
+action='createprocess' AND filename.dst IN ('7z.exe','zip.exe','powershell.exe') 
+  AND param.dst contains '%userprofile%\\' OR param.dst contains '%userprofile%\\Documents' 
+  AND later (network_connect AND method IN ('POST','PUT') AND direction='outbound') within 600s 
+  AND later (action='deletefile' AND filepath contains '%temp%\\' OR filepath contains '%userprofile%\\') within 120s
+\\Process creates an archive of user files, uploads it outbound, and then deletes local staging artifacts — typical exfil + cleanup behavior of SilentSync.
+\\MITRE: T1041, T1537, T1070.004
+
+<Helper cleanup: temp helper.py deleted shortly after network upload>
+action='deletefile' AND filepath contains '%temp%\\helper.py' 
+  AND earlier (network_connect AND method IN ('POST','PUT') AND direction='outbound') within 300s
+\\Post-exfil cleanup of helper payloads/artifacts in %TEMP% after outbound transfer — adversary anti-forensics pattern used by SilentSync.
+\\MITRE: T1070.004
+
+<High-confidence chain: PyPI site-packages write → pastebin fetch → helper.py exec → registry or crontab persistence>
+action='createfile' AND filepath contains '\\site-packages\\' 
+  AND later action='network_connect' AND request.url contains 'pastebin.com/raw' within 300s 
+  AND later action='createfile' AND filepath contains '%temp%\\helper.py' AND later action='createprocess' AND filename.dst IN ('python.exe') within 300s 
+  AND later ( action='regmodify' AND reg.path='HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' AND reg.new_value regex '(?i)pyhelper' OR action='crontab_modify' AND crontab.entry contains '@reboot' ) within 1800s
+\\Full delivery + persistence chain: malicious PyPI package drops code, fetches helper from pastebin, executes helper.py, and establishes persistence via HKCU Run or OS-specific autorun — high-confidence SilentSync infection lifecycle.
+\\MITRE: T1195, T1105, T1059.006, T1547
+
