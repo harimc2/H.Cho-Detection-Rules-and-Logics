@@ -1,0 +1,85 @@
+<DLL search-order hijack execution from non-standard directory>
+action='loadmodule' AND module.filepath startswith process.directory.src AND module.filepath NOT startswith 'C:\\Windows\\System32\\' 
+  AND module.signer.exists=false AND process.filename.src exists
+\\A legitimate executable loading a DLL from its own (non-system) directory where the DLL is unsigned — classic DLL search-order hijack / sideloading loader pattern used by RainyDay/PlugX/Turian.
+\\MITRE: T1574.001, T1218
+
+<Loader reads sibling encrypted blob then allocates large RWX memory>
+process.api_call contains 'GetModuleFileNameA' AND action='openfile' AND filepath startswith process.directory.src 
+  AND (filepath endswith '.dat' || filepath endswith '.src' || filepath endswith '.afx' || filepath endswith '.dat') 
+  AND later (process.api_call contains 'VirtualAlloc' || process.api_call contains 'VirtualAllocEx' || process.api_call contains 'VirtualProtect') within 60s
+\\Loader resolving its own path then opening a sibling data/blob file in the same directory and immediately allocating executable memory — behavior consistent with reading encrypted shellcode and unpacking it into memory.
+\\MITRE: T1105, T1055, T1574.001
+
+<RtlDecompressBuffer / decompression plus RC4-like decryption sequence in process>
+process.api_call contains 'RtlDecompressBuffer' OR process.api_call contains 'RtlDecompressBufferEx' 
+  AND (process.api_call contains 'CryptGenRandom' OR process.api_call contains 'CryptDecrypt' OR param.dst contains 'RC4' || param.dst contains 'XOR') 
+  AND later (process.api_call contains 'CreateThread' || process.api_call contains 'CreateRemoteThread') within 60s
+\\Process calling RtlDecompressBuffer (LZNT1 decompression) followed by cryptographic ops and thread creation — matches XOR/RC4 + LZNT1 unpacking chain used by the loaders to deploy shellcode into memory.
+\\MITRE: T1027, T1497, T1055
+
+<Sibling-shellcode-to-injection chain — read blob then WriteProcessMemory+CreateRemoteThread>
+action='openfile' AND filepath startswith process.directory.src AND filepath not endswith '.exe' 
+  AND later (process.api_call contains 'WriteProcessMemory' && process.api_call contains 'CreateRemoteThread') within 120s
+\\Loader reads a data/blob file co-located with the host executable and then performs WriteProcessMemory + CreateRemoteThread — clear indicator of in-memory shellcode injection/hijack execution.
+\\MITRE: T1055.001, T1574.001
+
+<SetUnhandledExceptionFilter + runtime string-decode / exception-handler flow>
+process.api_call contains 'SetUnhandledExceptionFilter' AND later (process.api_call contains 'UnhandledExceptionFilter' || param.dst contains 'ExceptionHandler') within 30s
+\\Use of SetUnhandledExceptionFilter and invoking exception-handler control flow is a loader technique to locate thread IDs / drive runtime code paths (observed in PlugX/RainyDay loaders that use exception-driven dispatch).
+\\MITRE: T1497, T1218
+
+<Unsigned helper/loader written into app dir that matches known loader-drop pattern>
+action='createfile' AND filepath startswith process.directory.src AND filepath endswith ('.dat','.src','.afx','.tmp') 
+  AND file.signer.exists=false AND file.created_within last 7d 
+  AND later (action='openfile' AND process.filename.src exists) within 120s
+\\New unsigned blob/helper files created in the same directory as an executable and then opened by that executable — loader drop + read pattern matching DLL-sideload style infections.
+\\MITRE: T1574.001, T1105
+
+<Timestomp / file timestamp anomaly for co-located loader or shellcode file>
+action='file_modify' AND filepath startswith process.directory.src AND (file.mtime > system.time || file.mtime significantly differs from directory.baseline) 
+  AND NOT file.signer.exists=true
+\\Files co-located with loaders/sideloaded DLLs that have future or anomalous modification times indicate timestomping / anti-forensics often used by these toolsets.
+\\MITRE: T1070.006, T1497
+
+<Keylogger / plug-in log write pattern under drop-folder observed repeatedly>
+action='createfile' AND filepath startswith process.directory.src AND filepath contains '\\logs\\' OR filepath contains '\\Log\\' 
+  AND count(createfile) >= 20 within 3600s by process.pid
+\\Frequent small writes to log directories under the malware drop folder are consistent with keylogger / plugin telemetry writing (Talos observed keylogger logs produced by PlugX variants).
+\\MITRE: T1056.001, T1537
+
+<High-confidence chain — SIDeloading exe loads unsigned sibling blob -> RtlDecompressBuffer -> VirtualAlloc -> WriteProcessMemory -> network_connect>
+action='loadmodule' AND module.filepath startswith process.directory.src AND module.signer.exists=false 
+  AND later (action='openfile' AND filepath startswith process.directory.src) within 30s 
+  AND later (process.api_call contains 'RtlDecompressBuffer' || process.api_call contains 'RC4') within 60s 
+  AND later (process.api_call contains 'VirtualAlloc' || process.api_call contains 'WriteProcessMemory' || process.api_call contains 'CreateRemoteThread') within 120s 
+  AND later (network_connect AND direction='outbound' AND protocol IN ('HTTPS','TCP')) within 300s
+\\Sequence: unsigned sibling DLL/blob loaded via sideload -> decompression/decryption -> memory allocation & injection -> outbound C2 — mirrors the full RainyDay/PlugX/Turian loader + in-memory payload lifecycle; use as high-confidence alert requiring containment.
+\\MITRE: T1574.001, T1027, T1055, T1071
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
